@@ -1,0 +1,11 @@
+services:
+  raid5-drill:
+    build: .
+    container_name: raid5-drill
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data   # 3 个虚拟盘文件与 meta.json 持久化在宿主机 ./data
+    restart: unless-stopped

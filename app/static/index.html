@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAID 5 单盘故障演练</title>
+<style>
+  :root { --ok:#1a7f37; --warn:#9a6700; --bad:#cf222e; --info:#0969da; --bg:#f6f8fa; --line:#d0d7de; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; margin:0; background:var(--bg); color:#1f2328; }
+  header { background:#24292f; color:#fff; padding:12px 20px; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  main { max-width:1100px; margin:18px auto; padding:0 16px; display:grid; gap:16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  button { font:inherit; padding:5px 12px; border:1px solid var(--line); border-radius:6px; background:#f6f8fa; cursor:pointer; }
+  button:hover:not(:disabled) { background:#eaeef2; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--info); border-color:var(--info); color:#fff; }
+  button.danger { background:var(--bad); border-color:var(--bad); color:#fff; }
+  select, input, textarea { font:inherit; padding:4px 8px; border:1px solid var(--line); border-radius:6px; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:12px; font-size:13px; color:#fff; }
+  .b-ok { background:var(--ok); } .b-warn { background:var(--warn); } .b-bad { background:var(--bad); } .b-info { background:var(--info); } .b-gray { background:#6e7781; }
+  .disks { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .disk { border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .disk h3 { margin:0 0 6px; font-size:14px; }
+  .disk .meta { font-size:12px; color:#57606a; margin:6px 0; min-height:16px; }
+  .stripes-ok { color:var(--ok); font-size:12px; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { border:1px solid var(--line); padding:5px 8px; text-align:center; font-size:13px; }
+  th { background:#f6f8fa; }
+  td.parity { background:#ddf4ff; }
+  td.missing { background:#f6f8fa; color:#8c959f; text-decoration:line-through; }
+  td.rebuilt { background:#dafbe1; }
+  td.pending { background:#fff8c5; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .banner { padding:8px 12px; border-radius:6px; margin:8px 0; font-size:14px; }
+  .banner.ok { background:#dafbe1; border:1px solid var(--ok); }
+  .banner.bad { background:#ffebe9; border:1px solid var(--bad); }
+  .banner.warn { background:#fff8c5; border:1px solid var(--warn); }
+  textarea { width:100%; height:64px; font-family:ui-monospace,monospace; }
+  pre { background:#f6f8fa; border:1px solid var(--line); border-radius:6px; padding:8px; font-size:12px; overflow:auto; max-height:180px; white-space:pre-wrap; word-break:break-all; }
+  #log { font-family:ui-monospace,monospace; font-size:12px; max-height:180px; overflow:auto; background:#0d1117; color:#c9d1d9; border-radius:6px; padding:8px 10px; }
+  #log div { padding:1px 0; }
+  .muted { color:#57606a; font-size:12px; }
+  .progress { display:flex; gap:6px; margin:6px 0; }
+  .progress .box { width:64px; text-align:center; padding:4px 0; border-radius:4px; border:1px solid var(--line); font-size:12px; background:#f6f8fa; }
+  .progress .box.done { background:#dafbe1; border-color:var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🗄️ RAID 5 单盘故障演练</h1>
+  <span>阵列状态：</span><span id="arrayState" class="badge b-gray">…</span>
+  <span class="muted">3 盘 × 4 条带 · 轮换异或校验 · 8 个逻辑块</span>
+  <span style="flex:1"></span>
+  <button class="danger" onclick="resetArray()">重置阵列（含演示数据）</button>
+</header>
+<main>
+  <section>
+    <h2>一、磁盘（本地文件模拟）</h2>
+    <div class="disks" id="disks"></div>
+  </section>
+
+  <section>
+    <h2>二、重建替换盘（逐条带）</h2>
+    <div id="rebuildBanner"></div>
+    <div class="row">
+      <label>故障注入：
+        <select id="failAt">
+          <option value="">不注入</option>
+          <option value="0">条带0写新盘失败</option>
+          <option value="1">条带1写新盘失败</option>
+          <option value="2">条带2写新盘失败</option>
+          <option value="3">条带3写新盘失败</option>
+        </select>
+      </label>
+      <button class="primary" id="btnRebuildAuto" onclick="startRebuild(true)">开始自动重建</button>
+      <button id="btnRebuildManual" onclick="startRebuild(false)">开始手动重建</button>
+      <button id="btnStep" onclick="stepRebuild()" disabled>单步重建一个条带</button>
+    </div>
+    <div class="progress" id="progress"></div>
+    <div class="muted">重建途中可继续在下方读写逻辑块（包括已重建的条带）；全部 4 个条带补齐最新内容后才显示「换盘完成」。</div>
+  </section>
+
+  <section>
+    <h2>三、条带映射（P=异或校验块，块N=逻辑块）</h2>
+    <table id="stripeTable"></table>
+  </section>
+
+  <section>
+    <h2>四、按逻辑块读写</h2>
+    <div class="row">
+      <label>逻辑块号：
+        <select id="lb"></select>
+      </label>
+      <button class="primary" onclick="writeBlock()">写入</button>
+      <button onclick="readBlock()">读取</button>
+      <button onclick="readAll()">读取全部 8 块核对</button>
+    </div>
+    <textarea id="writeData" placeholder="要写入的文本（UTF-8，不足 4096 字节补零）"></textarea>
+    <pre id="ioResult">（读写结果显示在这里）</pre>
+    <div id="allBlocks"></div>
+  </section>
+
+  <section>
+    <h2>五、操作日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const STATE_TEXT = { healthy:["健康","b-ok"], degraded:["降级（缺盘，可读写）","b-warn"],
+  rebuilding:["重建中","b-info"], rebuild_failed:["重建失败（保持降级）","b-bad"] };
+const SLOT_TEXT = { online:["在线","b-ok"], missing:["已摘除","b-bad"], rebuilding:["重建中","b-info"] };
+
+async function api(path, method="GET", body=null) {
+  const opt = { method, headers: {"Content-Type":"application/json"} };
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { alert((j.detail || r.statusText)); throw new Error(j.detail || r.statusText); }
+  return j;
+}
+
+function render(s) {
+  const [txt, cls] = STATE_TEXT[s.array_state] || [s.array_state, "b-gray"];
+  $("arrayState").textContent = txt; $("arrayState").className = "badge " + cls;
+
+  // 磁盘卡片
+  $("disks").innerHTML = s.slots.map(d => {
+    const [t, c] = SLOT_TEXT[d.state];
+    const rebuilt = d.state === "rebuilding"
+      ? `<div class="stripes-ok">已重建条带：${d.rebuilt_stripes.length ? d.rebuilt_stripes.join("、") : "无"}</div>` : "";
+    const canRemove = s.array_state === "healthy";
+    return `<div class="disk"><h3>盘 ${d.slot} <span class="badge ${c}">${t}</span></h3>
+      <div class="meta">${d.file_exists ? "disk"+d.slot+".img · "+d.size+" 字节" : "（无盘）"}</div>
+      ${rebuilt}
+      <button class="danger" ${canRemove?"":"disabled"} onclick="removeDisk(${d.slot})">摘除盘 ${d.slot}</button></div>`;
+  }).join("");
+
+  // 重建面板
+  const rb = s.rebuild, missing = s.slots.find(x => x.state === "missing"), reb = s.slots.find(x => x.state === "rebuilding");
+  let banner = "";
+  if (rb.complete) banner = `<div class="banner ok">✅ 换盘完成：新盘已补齐全部条带的最新内容。可再摘另一盘核对数据。</div>`;
+  else if (rb.failed) banner = `<div class="banner bad">❌ 重建失败：${rb.error}<br>阵列保持降级读写，已确认的写入不受影响，可调整故障注入后重试重建。</div>`;
+  else if (reb) banner = `<div class="banner warn">🔧 盘 ${reb.slot} 正在重建（${rb.next_stripe}/4）……</div>`;
+  else if (missing) banner = `<div class="banner warn">⚠️ 盘 ${missing.slot} 已摘除，阵列降级运行。请换上替换盘开始重建。</div>`;
+  $("rebuildBanner").innerHTML = banner;
+  $("btnRebuildAuto").disabled = $("btnRebuildManual").disabled = !missing || rb.active;
+  $("btnStep").disabled = !rb.active;
+  $("progress").innerHTML = [0,1,2,3].map(i =>
+    `<div class="box ${rb.rebuilt_stripes.includes(i) ? "done" : ""}">条带${i}${rb.rebuilt_stripes.includes(i)?" ✓":""}</div>`).join("");
+
+  // 条带映射表
+  let rows = `<tr><th>条带</th>${s.slots.map(d=>`<th>盘 ${d.slot}</th>`).join("")}</tr>`;
+  for (const st of s.stripes) {
+    rows += `<tr><td>条带 ${st.stripe}</td>` + st.cells.map(c => {
+      const slot = s.slots[c.disk];
+      const label = c.role === "parity" ? "P（校验）" : "块 " + c.logical_block;
+      let cls = c.role === "parity" ? "parity" : "";
+      if (slot.state === "missing") cls = "missing";
+      else if (slot.state === "rebuilding")
+        cls = rb.rebuilt_stripes.includes(st.stripe) ? "rebuilt" : "pending";
+      return `<td class="${cls}">${label}</td>`;
+    }).join("") + "</tr>";
+  }
+  $("stripeTable").innerHTML = rows;
+
+  // 日志
+  $("log").innerHTML = s.log.slice().reverse().map(e => `<div>[${e.ts}] ${e.msg}</div>`).join("");
+}
+
+async function refresh() { try { render(await api("/api/status")); } catch(e) {} }
+async function resetArray() { if (confirm("确定重置整个阵列？所有数据将被演示数据覆盖。")) { render(await api("/api/reset","POST")); } }
+async function removeDisk(slot) { if (confirm(`确定摘除盘 ${slot}？`)) { render(await api(`/api/disks/${slot}/remove`,"POST")); } }
+async function startRebuild(auto) {
+  const v = $("failAt").value;
+  render(await api("/api/rebuild/start","POST", { fail_at: v === "" ? null : +v, auto, delay: 0.8 }));
+}
+async function stepRebuild() { render(await api("/api/rebuild/step","POST")); }
+
+async function writeBlock() {
+  const lb = +$("lb").value, text = $("writeData").value;
+  const r = await api(`/api/blocks/${lb}`,"PUT", { text });
+  $("ioResult").textContent = `✅ 已写入逻辑块 ${lb}：${r.detail}`;
+  refresh();
+}
+async function readBlock() {
+  const lb = +$("lb").value;
+  const r = await api(`/api/blocks/${lb}`);
+  $("ioResult").textContent =
+    `逻辑块 ${r.logical_block}（条带${r.stripe}，物理位于盘${r.disk}）\n读取来源：${r.source}\n` +
+    `文本预览：${r.text_preview || "（空）"}\nHEX 前 96 字节：${r.hex.slice(0,192)}`;
+}
+async function readAll() {
+  const r = await api("/api/blocks");
+  $("allBlocks").innerHTML = "<table><tr><th>逻辑块</th><th>条带</th><th>所在盘</th><th>读取来源</th><th>内容预览</th></tr>" +
+    r.blocks.map(b => `<tr><td>${b.logical_block}</td><td>${b.stripe}</td><td>盘${b.disk}</td><td>${b.source}</td>
+      <td style="text-align:left">${(b.text_preview||"（空）").slice(0,60)}</td></tr>`).join("") + "</table>";
+}
+
+for (let i = 0; i < 8; i++) $("lb").insertAdjacentHTML("beforeend", `<option value="${i}">${i}</option>`);
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
